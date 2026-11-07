@@ -1,0 +1,503 @@
+
+#!/usr/bin/env python3
+"""
+KERN - File Integrity & Audit Engine
+
+A lightweight file integrity monitoring tool.
+
+Features:
+- SHA-256 file verification
+- Snapshot generation
+- Added, modified, and deleted file detection
+- JSON-based audit reports
+- Atomic snapshot writes
+- Configurable exclusion patterns
+
+Requirements:
+    Python 3.10+
+
+Usage:
+    python kern.py snapshot ./data --output baseline.json
+    python kern.py verify ./data --baseline baseline.json
+    python kern.py verify ./data --baseline baseline.json --json report.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+VERSION = "1.0.0"
+CHUNK_SIZE = 1024 * 1024
+
+
+class KernError(Exception):
+    """Base exception for KERN operations."""
+
+
+def timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def hash_file(path: Path) -> str:
+    """Calculate the SHA-256 digest of a file."""
+
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+        while chunk := file.read(CHUNK_SIZE):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def should_exclude(
+    relative_path: str,
+    patterns: list[str]
+) -> bool:
+    """Check whether a path matches an exclusion pattern."""
+
+    return any(
+        fnmatch.fnmatch(relative_path, pattern)
+        or fnmatch.fnmatch(
+            Path(relative_path).name, pattern
+        )
+        for pattern in patterns
+    )
+
+
+def scan_directory(
+    root: Path,
+    exclusions: list[str],
+    baseline_path: Path | None = None
+) -> tuple[dict[str, Any], list[str]]:
+    """
+    Build a SHA-256 inventory of a directory.
+
+    Symbolic links are intentionally skipped to avoid
+    following files outside the selected directory.
+    """
+
+    inventory = {}
+    errors = []
+
+    root = root.resolve()
+
+    excluded_baseline = (
+        baseline_path.resolve()
+        if baseline_path is not None
+        else None
+    )
+
+    for current_root, directories, files in os.walk(
+        root,
+        followlinks=False
+    ):
+        current = Path(current_root)
+
+        directories[:] = sorted(
+            directory
+            for directory in directories
+            if not (current / directory).is_symlink()
+            and not should_exclude(
+                (current / directory).relative_to(root).as_posix(),
+                exclusions
+            )
+        )
+
+        for filename in sorted(files):
+            file_path = current / filename
+
+            if file_path.is_symlink():
+                continue
+
+            if (
+                excluded_baseline is not None
+                and file_path.resolve() == excluded_baseline
+            ):
+                continue
+
+            relative = file_path.relative_to(root).as_posix()
+
+            if should_exclude(relative, exclusions):
+                continue
+
+            try:
+                stat = file_path.stat()
+
+                if not file_path.is_file():
+                    continue
+
+                inventory[relative] = {
+                    "sha256": hash_file(file_path),
+                    "size": stat.st_size,
+                }
+
+            except (OSError, PermissionError) as exc:
+                errors.append(
+                    f"{relative}: {exc}"
+                )
+
+    return inventory, errors
+
+
+def save_snapshot(
+    inventory: dict[str, Any],
+    output: Path,
+    root: Path
+) -> None:
+    """Save an inventory using an atomic file replacement."""
+
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot = {
+        "tool": "KERN",
+        "version": VERSION,
+        "created_at": timestamp(),
+        "root": str(root.resolve()),
+        "algorithm": "SHA-256",
+        "files": inventory,
+    }
+
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            delete=False
+        ) as temporary:
+
+            temporary_path = Path(temporary.name)
+
+            json.dump(
+                snapshot,
+                temporary,
+                indent=2,
+                sort_keys=True
+            )
+
+            temporary.write("\n")
+
+        os.replace(temporary_path, output)
+
+    finally:
+        if (
+            temporary_path is not None
+            and temporary_path.exists()
+        ):
+            temporary_path.unlink()
+
+
+def load_snapshot(path: Path) -> dict[str, Any]:
+    """Load and validate a previously generated snapshot."""
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            snapshot = json.load(file)
+
+    except (OSError, json.JSONDecodeError) as exc:
+        raise KernError(
+            f"Unable to read snapshot: {exc}"
+        ) from exc
+
+    if not isinstance(snapshot, dict):
+        raise KernError("Invalid snapshot format.")
+
+    if snapshot.get("algorithm") != "SHA-256":
+        raise KernError("Unsupported hash algorithm.")
+
+    files = snapshot.get("files")
+
+    if not isinstance(files, dict):
+        raise KernError("Snapshot file inventory is invalid.")
+
+    for name, metadata in files.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(metadata, dict)
+            or not isinstance(metadata.get("sha256"), str)
+            or len(metadata["sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in metadata["sha256"]
+            )
+            or not isinstance(metadata.get("size"), int)
+            or isinstance(metadata.get("size"), bool)
+            or metadata["size"] < 0
+        ):
+            raise KernError(
+                f"Invalid file metadata: {name}"
+            )
+
+    return snapshot
+
+
+def compare_inventories(
+    baseline: dict[str, Any],
+    current: dict[str, Any]
+) -> dict[str, list[str]]:
+    """Compare two inventories and classify file changes."""
+
+    baseline_files = set(baseline)
+    current_files = set(current)
+
+    added = sorted(current_files - baseline_files)
+    deleted = sorted(baseline_files - current_files)
+
+    modified = sorted(
+        name
+        for name in baseline_files & current_files
+        if baseline[name]["sha256"]
+        != current[name]["sha256"]
+    )
+
+    return {
+        "added": added,
+        "modified": modified,
+        "deleted": deleted,
+    }
+
+
+def print_report(
+    changes: dict[str, list[str]],
+    errors: list[str]
+) -> None:
+    """Display a readable audit report."""
+
+    print("\nKERN | FILE INTEGRITY REPORT")
+    print("=" * 42)
+
+    sections = [
+        ("ADDED", changes["added"]),
+        ("MODIFIED", changes["modified"]),
+        ("DELETED", changes["deleted"]),
+    ]
+
+    for title, items in sections:
+        print(f"\n{title}: {len(items)}")
+
+        for item in items:
+            print(f"  - {item}")
+
+    if errors:
+        print(f"\nERRORS: {len(errors)}")
+
+        for error in errors:
+            print(f"  ! {error}")
+
+    total = sum(len(items) for items in changes.values())
+
+    print("\n" + "=" * 42)
+
+    if errors:
+        print("RESULT: INCOMPLETE - SCAN ERRORS")
+    elif total:
+        print("RESULT: CHANGES DETECTED")
+    else:
+        print("RESULT: INTEGRITY VERIFIED")
+
+
+def export_report(
+    changes: dict[str, list[str]],
+    errors: list[str],
+    output: Path
+) -> None:
+    """Export audit results as JSON."""
+
+    report = {
+        "tool": "KERN",
+        "version": VERSION,
+        "generated_at": timestamp(),
+        "status": (
+            "error" if errors
+            else "changed" if any(changes.values())
+            else "clean"
+        ),
+        "summary": {
+            key: len(value)
+            for key, value in changes.items()
+        },
+        "changes": changes,
+        "errors": errors,
+    }
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with output.open("w", encoding="utf-8") as file:
+        json.dump(report, file, indent=2)
+
+        file.write("\n")
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="kern",
+        description=(
+            "KERN - File Integrity & Audit Engine"
+        )
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"KERN {VERSION}"
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True
+    )
+
+    snapshot = subparsers.add_parser(
+        "snapshot",
+        help="Create a file integrity baseline."
+    )
+
+    snapshot.add_argument("directory", type=Path)
+
+    snapshot.add_argument(
+        "--output",
+        type=Path,
+        default=Path("kern-baseline.json")
+    )
+
+    snapshot.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[".git", "__pycache__", "*.pyc"]
+    )
+
+    verify = subparsers.add_parser(
+        "verify",
+        help="Verify files against an existing baseline."
+    )
+
+    verify.add_argument("directory", type=Path)
+
+    verify.add_argument(
+        "--baseline",
+        type=Path,
+        required=True
+    )
+
+    verify.add_argument(
+        "--json",
+        type=Path,
+        help="Optional JSON audit report."
+    )
+
+    verify.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[".git", "__pycache__", "*.pyc"]
+    )
+
+    return parser
+
+
+def main() -> int:
+    parser = create_parser()
+    args = parser.parse_args()
+
+    try:
+        root = args.directory.resolve()
+
+        if not root.is_dir():
+            raise KernError(
+                f"Directory does not exist: {root}"
+            )
+
+        if args.command == "snapshot":
+
+            inventory, errors = scan_directory(
+                root,
+                args.exclude,
+                args.output
+            )
+
+            if errors:
+                print_report(
+                    {
+                        "added": [],
+                        "modified": [],
+                        "deleted": [],
+                    },
+                    errors
+                )
+                return 2
+
+            save_snapshot(
+                inventory,
+                args.output,
+                root
+            )
+
+            print(
+                f"\nSnapshot created successfully: "
+                f"{args.output}"
+            )
+
+            print(f"Files indexed: {len(inventory)}")
+
+            return 0
+
+        if args.command == "verify":
+
+            if not args.baseline.is_file():
+                raise KernError(
+                    f"Baseline not found: {args.baseline}"
+                )
+
+            baseline = load_snapshot(args.baseline)
+
+            inventory, errors = scan_directory(
+                root,
+                args.exclude,
+                args.baseline
+            )
+
+            changes = compare_inventories(
+                baseline["files"],
+                inventory
+            )
+
+            print_report(changes, errors)
+
+            if args.json:
+                export_report(
+                    changes,
+                    errors,
+                    args.json
+                )
+
+                print(
+                    f"\nJSON report saved: {args.json}"
+                )
+
+            if errors:
+                return 2
+
+            return 1 if any(changes.values()) else 0
+
+    except (KernError, OSError) as exc:
+        print(f"\nKERN ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
